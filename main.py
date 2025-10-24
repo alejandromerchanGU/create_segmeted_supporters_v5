@@ -11,6 +11,7 @@ from typing import Iterable, List, Dict, Any, Generator
 import json
 from botocore.exceptions import ClientError
 import sys
+import io
 
 load_dotenv()
 
@@ -33,7 +34,9 @@ logger = logging.getLogger(__name__)
 #Configue database env
 snowflake_database = os.environ.get("SNOWFLAKE_DATABASE")
 
-def get_manager():
+def get_manager(user, account, warehouse, database, schema, region, role):
+
+    #logging.info(f"--- connection: {user}  {account} {warehouse} {database} {schema } {role} {region}")
 
     ssm = boto3.client('ssm')  # NOSONAR
     passphrase_bytes = ssm.get_parameter(Name="/app/phase_runner/SNOWFLAKE_PASSPHRASE", WithDecryption=True)["Parameter"]["Value"].encode('utf-8')
@@ -54,14 +57,14 @@ def get_manager():
         encryption_algorithm=serialization.NoEncryption()
     )
     snowflake_manager = SnowflakeManager(
-        user='GOODUNITEDAPI_SERVICE_USER',
+        user=user,
         private_key=private_key_bytes,
-        account="YSB01509",
-        warehouse='GU_WH_DEV',
-        database='DB_GU_DWH',
-        schema='CORE_TABLES',
-        region='us-east-1',
-        role='SYSADMIN'
+        account=account,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        region=region,
+        role=role
     )
     return snowflake_manager
 
@@ -82,7 +85,7 @@ def process_segment(snowflake_manager: SnowflakeManager, nonprofit_id: int, segm
             """
 
         update_status_sql = f"""
-            UPDATE DB_GU_DWH.CORE_TABLES.SUPPORTER_SEGMENTS
+            UPDATE {snowflake_database}.CORE_TABLES.SUPPORTER_SEGMENTS
             SET
                 STATUS = 'updated',
                 STATUS_AT = CURRENT_TIMESTAMP()
@@ -285,6 +288,11 @@ def send_to_lambda(nonprofit_id: int,
                 logging.exception(
                     f"fails calling the lambda for np: {np_id}"
                 )
+                traceback_buffer = io.StringIO()
+                traceback.print_exc(file=traceback_buffer)
+                logging.error("An error occurred:\n%s", traceback_buffer.getvalue())
+                raise
+
 
 def test_call_segments_service(token):
     base_url = "https://segment.dev.goodunited.io/nonprofit/30/segments/cache-sync/remove-segment"
@@ -312,11 +320,11 @@ def call_segments_service(
     import json
 
     op = operation.strip().lower()
-    if op not in ("insert_segments", "remove_segments"):
+    if op not in ("insert-segment", "remove-segment"):
         logger.error(f"[segments-service] Invalid operation: {operation}")
         return
 
-    path = "insert_segments" if op == "insert-segments" else "remove-segment"
+    path = "insert-segment" if op == "insert-segment" else "remove-segment"
     base_url = f"https://{env}/nonprofit/{nonprofit_id}/segments/cache-sync/{path}"
 
     headers = {
@@ -328,7 +336,7 @@ def call_segments_service(
     logger.info(f"[segments-service] Starting HTTP call: op={op}, url={base_url}, np={nonprofit_id}")
 
     # Select data source based on operation (DRY)
-    if op == "insert_segments":
+    if op == "insert-segment":
         rows = snowflake_manager.fetch_triggered_supporters_grouped(nonprofit_id, snowflake_database)
         empty_msg = f"[segments-service] -- No supporters to insert, nonprofit: {nonprofit_id}"
     else:  # remove_segments
@@ -389,6 +397,10 @@ def call_segments_service(
                 logger.exception(
                     f"[segments-service] Exception while calling endpoint for np={np_id}, seg={seg_id}, batch={batch_idx}"
                 )
+                traceback_buffer = io.StringIO()
+                traceback.print_exc(file=traceback_buffer)
+                logging.error("An error occurred:\n%s", traceback_buffer.getvalue())
+                raise
 
     # rows: iterable of (nonprofit_id, segment_id, supporter_ids_json)
     for row in rows:
@@ -425,15 +437,23 @@ def main():
     lambda_env = os.environ.get("LAMBDA_ENV")
     np_id = os.environ.get("NP_ID")
 
-    snowflake_manager = get_manager()
+    user = os.environ.get("USER_DB")
+    account=os.environ.get("ACCOUNT_DB")
+    warehouse=os.environ.get("WAREHOUSE_DB")
+    database=os.environ.get("DATABASE")
+    schema=os.environ.get("SCHEMA_DB")
+    region=os.environ.get("REGION_DB")
+    role=os.environ.get("ROLE_DB")
+
+    snowflake_manager = get_manager(user, account, warehouse, database, schema, region, role)
     snowflake_manager.connect()
     #nps = snowflake_manager.get_nps()
 
     logger.info(f"--- processing segments for np: {np_id}")
     process_segments(np_id, snowflake_manager)
 
-    call_segments_service(np_id,'insert_segments',snowflake_manager,service_env,token,8000)
-    call_segments_service(np_id,'remove_segments',snowflake_manager,service_env,token,8000)
+    call_segments_service(np_id,'insert-segment',snowflake_manager,service_env,token,8000)
+    call_segments_service(np_id,'remove-segment',snowflake_manager,service_env,token,8000)
     send_to_lambda(np_id,snowflake_manager,lambda_env)
 
 

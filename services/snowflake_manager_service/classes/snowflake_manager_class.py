@@ -17,6 +17,7 @@ class SnowflakeManager:
     
     def connect(self):
         try:
+            #logging.info(f"--- connection: {self.user} {self.private_key} {self.account} {self.warehouse} {self.database} {self.schema } {self.role} {self.region}")
             self.conn = snowflake.connector.connect(
                 user=self.user,
                 private_key=self.private_key,
@@ -137,7 +138,8 @@ class SnowflakeManager:
                 UPDATE SUPPORTER_SEGMENTS
                 SET 
                     STATUS = '{status}',
-                    STATUS_AT = CURRENT_TIMESTAMP()
+                    STATUS_AT = CURRENT_TIMESTAMP(),
+                    ERROR_DETAILS = NULL
                 WHERE SEGMENTS_ID = {segment_id}
                     AND NONPROFIT_ID = {nonprofit_id}
                 """
