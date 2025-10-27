@@ -90,6 +90,16 @@ class SnowflakeManager:
         query_output = self.execute_query(query, True)
         return query_output
 
+    def update_nonprofit_status(self, nonprofit_id):
+        query = f"""
+                    UPDATE NONPROFIT_CONTROL_SEGMENT
+                        SET STATUS = 'stopped',
+                            LAST_RUNNING_AT = CURRENT_TIMESTAMP()
+                    WHERE NONPROFIT_ID = {nonprofit_id} 
+                """
+        query_output = self.execute_query(query, True)
+        return query_output
+
     def fetch_segments(self, nonprofit_id):
         query = f"""
                 SELECT SEGMENTS_ID, SEGMENT_NAME, FILTER_GENERATED_SQL, LIST, STATUS

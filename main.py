@@ -165,10 +165,9 @@ def process_segment(snowflake_manager: SnowflakeManager, nonprofit_id: int, segm
             created_by_desc = "'created_seg_supporter_pyprocess_ao'"
             insert_sql = f"""
                 INSERT INTO {snowflake_database}.CORE_TABLES.SEGMENTED_SUPPORTER (
-                    ID, SEGMENT_ID, NONPROFIT_ID, SUPPORTER_ID, CREATED_AT, CREATED_BY, DELETED
+                    SEGMENT_ID, NONPROFIT_ID, SUPPORTER_ID, CREATED_AT, CREATED_BY, DELETED
                 )
                 SELECT
-                    {snowflake_database}.CORE_TABLES.SEQ_SEGMENTED_SUPPORTER_HYBRID.NEXTVAL,
                     SEGMENT_ID,
                     NONPROFIT_ID,
                     SUPPORTER_ID,
@@ -318,6 +317,10 @@ def call_segments_service(
 ) -> None:
     import requests
     import json
+    import time
+    import io
+    import traceback
+    import logging
 
     op = operation.strip().lower()
     if op not in ("insert-segment", "remove-segment"):
@@ -333,6 +336,9 @@ def call_segments_service(
         "x-private-access-token": "1"
     }
 
+    # Evita exponer el token en logs
+    safe_headers_for_log = {**headers, "Authorization": "Bearer ***REDACTED***"}
+
     logger.info(f"[segments-service] Starting HTTP call: op={op}, url={base_url}, np={nonprofit_id}")
 
     # Select data source based on operation (DRY)
@@ -347,9 +353,58 @@ def call_segments_service(
         logger.info(empty_msg)
         return
 
-    timeout_secs = 30
+    timeout_secs = 60
     total_batches = 0
     total_supporters = 0
+
+    def _post_with_retries(url: str, headers: dict, payload: dict, np_id: int, seg_id: int, batch_idx: int):
+        """
+        Intenta hasta 3 veces:
+          1) intento inmediato
+          2) si falla -> dormir 30s y reintentar
+          3) si falla -> dormir 60s y reintentar
+        Considera 'falla' tanto excepciones de requests como HTTP >= 400.
+        Devuelve el objeto 'resp' si tiene éxito; si no, None.
+        """
+        backoffs = [0, 30, 60]  # segundos antes de cada intento (0s, 30s, 60s)
+        last_error_text = None
+
+        for attempt, sleep_s in enumerate(backoffs, start=1):
+            if sleep_s:
+                logger.warning(f"[segments-service] Retry sleep {sleep_s}s "
+                               f"(np={np_id}, seg={seg_id}, batch={batch_idx}, attempt={attempt})")
+                time.sleep(sleep_s)
+
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout_secs)
+                status = resp.status_code
+
+                if 200 <= status < 300:
+                    # Éxito
+                    return resp
+
+                # HTTP error
+                err_preview = (resp.text or "")[:500]
+                last_error_text = f"HTTP {status} body={err_preview}"
+                logger.error(
+                    f"[segments-service] HTTP error (np={np_id}, seg={seg_id}, batch={batch_idx}, "
+                    f"attempt={attempt}): {last_error_text}"
+                )
+
+            except Exception as e:
+                # Excepción de red/timeout/etc.
+                last_error_text = repr(e)
+                logger.exception(
+                    f"[segments-service] Exception on POST (np={np_id}, seg={seg_id}, batch={batch_idx}, "
+                    f"attempt={attempt})"
+                )
+
+        # Después de agotar los intentos, imprime/guarda el traceback y continúa (no raise)
+        logger.error(
+            f"[segments-service] Final failure after retries (np={np_id}, seg={seg_id}, batch={batch_idx}). "
+            f"Last error: {last_error_text}"
+        )
+        return None
 
     def _send_batches(np_id: int, seg_id: int, supporter_ids_json: str) -> None:
         nonlocal total_batches, total_supporters
@@ -371,36 +426,31 @@ def call_segments_service(
                 "segmentId": str(seg_id),
                 "supporterIds": [str(x) for x in chunk]
             }
-            try:
-                print(f'--- headers: {headers}')
-                resp = requests.post(
-                    base_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout_secs,
-                )
+
+            logger.debug(f"[segments-service] POST headers (safe): {safe_headers_for_log}")
+
+            resp = _post_with_retries(
+                url=base_url,
+                headers=headers,
+                payload=payload,
+                np_id=np_id,
+                seg_id=seg_id,
+                batch_idx=batch_idx
+            )
+
+            if resp is not None:
                 total_batches += 1
                 total_supporters += len(chunk)
-
                 logger.info(
-                    f"[segments-service] POST {base_url} "
-                    f"np={np_id}, seg={seg_id}, batch={batch_idx}, size={len(chunk)}, "
-                    f"status={resp.status_code}"
+                    f"[segments-service] POST OK {base_url} "
+                    f"np={np_id}, seg={seg_id}, batch={batch_idx}, size={len(chunk)}, status={resp.status_code}"
                 )
-
-                if resp.status_code >= 400:
-                    logger.error(
-                        f"[segments-service] HTTP error ({resp.status_code}) np={np_id}, seg={seg_id}, "
-                        f"batch={batch_idx}, body={resp.text[:500]}"
-                    )
-            except Exception:
-                logger.exception(
-                    f"[segments-service] Exception while calling endpoint for np={np_id}, seg={seg_id}, batch={batch_idx}"
+            else:
+                # Ya se logueó el fallo; continuamos con el siguiente batch
+                logger.warning(
+                    f"[segments-service] Skipping batch after final failure "
+                    f"(np={np_id}, seg={seg_id}, batch={batch_idx}, size={len(chunk)})"
                 )
-                traceback_buffer = io.StringIO()
-                traceback.print_exc(file=traceback_buffer)
-                logging.error("An error occurred:\n%s", traceback_buffer.getvalue())
-                raise
 
     # rows: iterable of (nonprofit_id, segment_id, supporter_ids_json)
     for row in rows:
@@ -455,6 +505,9 @@ def main():
     call_segments_service(np_id,'insert-segment',snowflake_manager,service_env,token,8000)
     call_segments_service(np_id,'remove-segment',snowflake_manager,service_env,token,8000)
     send_to_lambda(np_id,snowflake_manager,lambda_env)
+
+    snowflake_manager.update_nonprofit_status(np_id)
+    logger.info(f"--- segments for np: {np_id} where completed")
 
 
 if __name__ == "__main__":
