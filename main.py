@@ -12,6 +12,8 @@ import json
 from botocore.exceptions import ClientError
 import sys
 import io
+import time
+
 
 load_dotenv()
 
@@ -71,7 +73,7 @@ def get_manager(user, account, warehouse, database, schema, region, role):
 def process_segment(snowflake_manager: SnowflakeManager, nonprofit_id: int, segment_id: int, filter_generated_sql: str,
                     current_status: str, delete_only: bool) -> None:
     try:
-        snowflake_manager.begin_transaction()
+        #snowflake_manager.begin_transaction()
 
         delete_sql = f"""
             DELETE FROM {snowflake_database}.CORE_TABLES.SEGMENTED_SUPPORTER
@@ -107,6 +109,7 @@ def process_segment(snowflake_manager: SnowflakeManager, nonprofit_id: int, segm
             snowflake_manager.execute_query(insert_remove_trasient_sql)
             snowflake_manager.execute_query(delete_sql)
             snowflake_manager.execute_query(delete_read_sql)
+            snowflake_manager.begin_transaction()
             snowflake_manager.execute_query(update_status_sql)
         else:
             insert_journey_trigger_transient_sql = f"""
@@ -197,6 +200,7 @@ def process_segment(snowflake_manager: SnowflakeManager, nonprofit_id: int, segm
             snowflake_manager.execute_query(delete_read_sql)
             snowflake_manager.execute_query(insert_sql)
             snowflake_manager.execute_query(insert_read_sql)
+            snowflake_manager.begin_transaction()
             snowflake_manager.execute_query(update_status_sql)
 
         snowflake_manager.commit()
@@ -209,25 +213,65 @@ def process_segments(nonprofit_id: int, snowflake_manager) -> None:
     ##snowflake_manager.connect()
     snowflake_manager.create_trasient_table(nonprofit_id, snowflake_database)
     segments = snowflake_manager.fetch_segments(nonprofit_id)
+
     for segment in segments:
         segment_id = segment[0]
         segment_name = segment[1]
         filter_generated_sql = segment[2]
         segment_list = segment[3]
         status = segment[4]
-        try:
-            update_output = snowflake_manager.update_segment_status(nonprofit_id, segment_id, 'processing')
-            logger.info(f"Updated segment status {segment_id} - {segment_name} and updated rows in supporter_segments table: " + str(update_output))
-            process_segment(snowflake_manager, nonprofit_id, segment_id, filter_generated_sql, status, segment_list is None or segment_list == [] or segment_list == '[]')
-        except Exception as e:
-            error_details = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"Error processing segment {segment_id} - {segment_name} (nonprofit {nonprofit_id}): {error_details}", exc_info=True)
-            snowflake_manager.update_segment_error_status(
-                nonprofit_id,
-                segment_id,
-                status,
-                error_details
-            )
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                update_output = snowflake_manager.update_segment_status(
+                    nonprofit_id, segment_id, 'processing'
+                )
+                logger.info(
+                    f"Updated segment status {segment_id} - {segment_name} "
+                    f"and updated rows in supporter_segments table: {update_output}"
+                )
+
+                process_segment(
+                    snowflake_manager,
+                    nonprofit_id,
+                    segment_id,
+                    filter_generated_sql,
+                    status,
+                    segment_list is None or segment_list == [] or segment_list == '[]'
+                )
+                break
+
+            except Exception as e:
+                error_details = f"{str(e)}\n{traceback.format_exc()}"
+                if "statement failed to acquire a valid snapshot" in error_details:
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"Snapshot error detected for segment {segment_id} "
+                            f"(attempt {attempt}/{max_retries}). Retrying in 30 seconds..."
+                        )
+                        time.sleep(30)
+                        continue
+                    else:
+                        logger.error(
+                            f"Max retries reached for segment {segment_id} - {segment_name}. "
+                            f"Final error: {error_details}"
+                        )
+                else:
+                    logger.error(
+                        f"Error processing segment {segment_id} - {segment_name} "
+                        f"(nonprofit {nonprofit_id}): {error_details}",
+                        exc_info=True
+                    )
+
+                # actualizar el estado de error si no se pudo recuperar
+                snowflake_manager.update_segment_error_status(
+                    nonprofit_id,
+                    segment_id,
+                    status,
+                    error_details
+                )
+                break
 
 def _chunked(lst: List[int], n:int) -> Generator[List[int], None, None]:
     for i in range(0, len(lst), n):
@@ -502,8 +546,8 @@ def main():
     logger.info(f"--- processing segments for np: {np_id}")
     process_segments(np_id, snowflake_manager)
 
-    call_segments_service(np_id,'insert-segment',snowflake_manager,service_env,token,8000)
-    call_segments_service(np_id,'remove-segment',snowflake_manager,service_env,token,8000)
+    call_segments_service(np_id,'insert-segment',snowflake_manager,service_env,token,5000)
+    call_segments_service(np_id,'remove-segment',snowflake_manager,service_env,token,5000)
     send_to_lambda(np_id,snowflake_manager,lambda_env)
 
     snowflake_manager.update_nonprofit_status(np_id)
